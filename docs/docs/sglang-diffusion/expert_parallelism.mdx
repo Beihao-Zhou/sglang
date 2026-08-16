@@ -54,7 +54,7 @@ Measured on 2×H100 80GB, LingBot-Video MoE 30B, 640×384, 17 frames, 12 steps,
 | --- | --- | --- | --- |
 | VRAM per GPU (after load) | 74.4 GB | 31.5 GB | sharded |
 | VRAM per GPU (denoise peak) | 74.4 GB | 42.0 GB | — |
-| Denoise per step | 1.81 s / 1.64 s | 1.39 s / 1.13 s | — |
+| Denoise per step | 1.81 s / 1.64 s | 1.39 s / 1.11 s | — |
 | Total pixel-generation time | 63.7 s | 31.5 s | 8.5 s |
 
 Two runs of each configuration are shown for per-step time because wall-clock
@@ -209,6 +209,19 @@ A healthy run logs the exclusion, e.g. for 48 blocks × 2 expert tensors:
 ```text
 Excluding 96 parameters from FSDP sharding in LingBotVideoTransformer3DModel
 ```
+
+### Router-replication guard
+
+Summing per-rank partial outputs only reconstructs the dense result if every rank
+routed each token to the *same* experts. That holds because the router is
+replicated and its input is TP-identical — but a violation is silent: the ranks
+would compute disjoint halves of two *different* routings, sum them, and produce
+a plausible but wrong result. Observed signature when this happens: per-block
+cosine against dense drops to ~0.887, versus 0.99999 when healthy.
+
+On the first EP forward each block all-gathers a checksum of its router weights
+across the group and raises if they disagree. It runs once per block, and the
+end-to-end output is bitwise unchanged with the guard in place.
 
 ## Verifying a change to EP
 

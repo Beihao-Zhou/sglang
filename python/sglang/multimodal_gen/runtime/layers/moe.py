@@ -293,6 +293,33 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             self.shared_experts = LingBotVideoMLP(
                 hidden_size, intermediate_size * n_shared_experts
             )
+        self._router_replication_checked = not self.ep_enabled
+
+    def _check_router_is_replicated(self) -> None:
+        """Fail loudly if the ranks would route the same token differently.
+
+        EP re-forms the dense result by summing each rank's partial output, which
+        is only the dense sum if every rank selected the *same* experts for a
+        token. That holds because the router is replicated and its input is
+        TP-identical -- but nothing else enforces it, and a violation is silent:
+        the ranks compute disjoint halves of two different routings, sum them,
+        and produce a plausible but wrong result.
+        """
+        self._router_replication_checked = True
+        checksum = torch.stack(
+            [
+                self.router.weight.double().sum(),
+                self.router.e_score_correction_bias.double().sum(),
+            ]
+        )
+        gathered = get_tp_group().all_gather(checksum.reshape(1, -1), dim=0)
+        if not torch.equal(gathered, gathered[:1].expand_as(gathered)):
+            raise RuntimeError(
+                "MoE router weights differ across the expert parallel group "
+                f"(per-rank checksums: {gathered.tolist()}). Expert parallelism "
+                "sums each rank's partial output, which only reconstructs the "
+                "dense result when every rank routes a token to the same experts."
+            )
 
     def _run_sglang_triton_experts(
         self,
@@ -347,6 +374,10 @@ class LingBotVideoSparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         b = hidden_states.shape[0]
         tokens = hidden_states.reshape(-1, self.hidden_size)
+        if not self._router_replication_checked:
+            # Once per block, on the first forward -- the weights are loaded by
+            # then, and every rank reaches this in the same order.
+            self._check_router_is_replicated()
         top_indices, top_scores = self.router(tokens)
         out = self._run_sglang_triton_experts(tokens, top_scores, top_indices)
         if self.ep_enabled:

@@ -9,8 +9,8 @@ User-facing documentation of the feature itself lives in
 record: what was broken, what was learned, and what is left.
 
 **State:** implementation complete and validated end-to-end on 2xH100. 41 unit
-tests pass (from 16 passed / 1 failed at the start of review). Not yet reviewed
-by anyone else.
+tests plus a 2-GPU parity test pass (from 16 passed / 1 failed at the start of
+review). Not yet reviewed by anyone else.
 
 ---
 
@@ -101,7 +101,7 @@ excludes ROCm via `current_platform.is_hip()`.
 
 ### 1.8 Two srt Triton bugs — guarded, not fixed
 
-Found while verifying the sentinel (see 1.9). Both are reachable **only** when EP is on
+Found while verifying the sentinel (see 1.10). Both are reachable **only** when EP is on
 (`filter_expert=True`) and both are off by default, so they are latent rather
 than live — but both are silent corruption, not crashes:
 
@@ -117,7 +117,16 @@ Nothing disables TMA for `filter_expert` — only for LoRA hooks. The MoE block 
 refuses both configurations up front with a message naming the flag. **These
 remain unfixed upstream; see next steps.**
 
-### 1.9 A bug that was avoided (worth recording)
+### 1.9 The 2-GPU test would never have run in CI
+
+Unlike the glob-discovered `unit` suite (1.7), `single_test_file/` tests are
+**explicitly listed**: a file must appear in both `STANDALONE_FILES["2-gpu"]` and
+`STANDALONE_FILE_EST_TIMES` in `test/server/gpu_cases.py` or it is simply never
+executed. Two opposite traps in one directory tree — one auto-runs a test on
+hardware you did not intend, the other silently never runs it at all.
+`test_moe_expert_parallel_2_gpu.py` is registered in both.
+
+### 1.10 A bug that was avoided (worth recording)
 
 `EP_PLAN.md` step 2 specified a sentinel `>= num_local_experts` for non-local
 experts. That would have been silent memory corruption: `moe_align_block_size`
@@ -222,11 +231,71 @@ holds.
 
 ---
 
-## 3. Known gaps in what was validated
+## 3. How this was validated (reproduction)
+
+Environment: 2x H100 80GB, `source /workspace/env.sh`. Two quirks: export
+`LD_LIBRARY_PATH=$CONDA_PREFIX/lib` or `import sglang` fails inside a heredoc
+with a `CXXABI_1.3.15` error, and pass the **local snapshot path** as
+`--model-path` (a repo id makes the loader re-download all 63 files, refiner
+included — see 2.3).
+
+**Unit / kernel level**
+
+```bash
+python -m pytest python/sglang/multimodal_gen/test/unit/test_lingbot_video_moe.py \
+                 python/sglang/multimodal_gen/test/unit/test_fsdp_load.py -q   # 41 passed
+python -m pytest python/sglang/multimodal_gen/test/single_test_file/test_moe_expert_parallel_2_gpu.py -q
+```
+
+The 2-GPU file is the one that matters for the partition: it asserts the ranks
+hold *different* expert shards that tile `[0, num_experts)`, that a sharded
+forward plus the real all-reduce matches a dense block (cosine 0.9999961,
+~1 bf16 ulp), and that the router-replication guard fires when the ranks'
+routers disagree.
+
+**End-to-end.** Baseline and EP differ only in `--ep-size`:
+
+```bash
+MP=<local snapshot dir>
+P="A red fox walks through a snowy forest at sunrise, camera slowly panning right"
+COMMON="--num-gpus 2 --tp-size 2 --text-encoder-cpu-offload --dit-cpu-offload true \
+        --width 640 --height 384 --num-frames 17 --num-inference-steps 12 \
+        --seed 0 --save-output"
+
+sglang generate --model-path "$MP" --prompt "$P" $COMMON --ep-size 1 --output-path out/base
+sglang generate --model-path "$MP" --prompt "$P" $COMMON --ep-size 2 --output-path out/ep
+```
+
+Read latency from `Pixel data generated successfully in ... seconds`, per-step
+from `[DenoisingStage] average time per step`, VRAM from `nvidia-smi` during the
+run. Confirm the resolved config in the logged server-args JSON (`"ep_size": 2`)
+— and confirm no `Falling back to diffusers backend` line, or the numbers are
+void. Runs used for the tables:
+
+| purpose | configuration |
+| --- | --- |
+| baseline | `--ep-size 1` (twice, for the noise floor) |
+| EP | `--ep-size 2` (twice, for EP determinism) |
+| 1-step | both arms at `--num-inference-steps 1` |
+| FSDP arms | `--use-fsdp-inference true --dit-cpu-offload false`, `--ep-size` 1 and 2 |
+
+**Comparing outputs.** Decode both videos with PyAV (imageio's pyav plugin is
+broken in this env) and report MSE / PSNR / cosine / per-frame mean delta. The
+throwaway script lived in the session scratchpad; it is ~30 lines around
+`av.open(path)` + `frame.to_ndarray(format="rgb24")`.
+
+**The reduction-strategy comparison** (bf16 vs fp32 vs `no_combine`) was a
+standalone harness calling `fused_experts` directly at the production shape
+(E=128, I=512, H=1024, top_k=8) under a single-rank srt process group, summing
+per-rank partials in each strategy and reporting cosine against the dense call.
+Not committed; the numbers it produced are in 2.1 and in the feature doc.
+
+## 4. Known gaps in what was validated
 
 - **Only `ep_size=2` was exercised on the real model.** `ep_size` 4 and 8 are
   covered synthetically (kernel level) but never on a full pipeline; this pod has
-  2 GPUs.
+  2 GPUs. The *partition* is now covered at 2 ranks by
+  `test_moe_expert_parallel_2_gpu.py`, but higher degrees remain single-process.
 - **The FSDP+EP comparison changed two flags.** The FSDP runs also had
   `--dit-cpu-offload false`. Placement should not affect arithmetic, but the
   isolation is not clean.
@@ -241,13 +310,15 @@ holds.
   `ignored_params`.** Harmless today (experts are raw `nn.Parameter`s, not
   LoRA-wrapped), but it is the one other `fully_shard` call site that would need
   the kwarg if LoRA ever wraps expert weights.
-- **EP correctness rests on an unasserted invariant**: that the router is
-  replicated and its input is bit-identical across TP ranks. True today
-  (`RowParallelLinear` all-reduces `to_out`), but nothing checks it.
+- ~~EP correctness rests on an unasserted invariant (router replication).~~
+  **Closed**: the MoE block now checks router equality across the EP group on the
+  first forward, and the 2-GPU test pins that the guard fires. The *input* side of
+  the invariant (activations TP-identical, via `RowParallelLinear`) is still
+  unasserted, but a violation there would break TP generally, not just EP.
 
 ---
 
-## 4. Next steps
+## 5. Next steps
 
 **Before leaving draft**
 
@@ -273,5 +344,4 @@ holds.
 6. **Phase 3 — FP8/NVFP4 expert quantization**, per `EP_PLAN.md`. The load path
    would need to slice per-expert *scales* on the same expert range as the
    weights.
-7. Consider asserting the router-replication invariant from section 3, since
-   silent violation would break EP correctness in a way no current test catches.
+7. ~~Assert the router-replication invariant.~~ Done — see section 4.

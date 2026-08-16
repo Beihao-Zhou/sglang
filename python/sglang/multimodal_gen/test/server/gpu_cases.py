@@ -1179,6 +1179,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_moe_expert_parallel_2_gpu.py",
     ],
 }
 
@@ -1222,6 +1223,9 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        # ~250 s locally: two ranks build the MoE block, JIT the triton MoE
+        # kernels, and run a sharded/dense parity check plus the guard case
+        "../single_test_file/test_moe_expert_parallel_2_gpu.py": 420.0,
     },
 }
 

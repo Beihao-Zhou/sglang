@@ -154,6 +154,44 @@ class TestFSDPEntrypointRegistration(unittest.TestCase):
         register.assert_not_called()
 
 
+class TestFSDPIgnoredParams(unittest.TestCase):
+    """Parameters another parallelism axis owns must be excluded from sharding.
+
+    Expert parallelism gives each rank a *different* expert slice, so letting
+    FSDP shard those tensors too would make its all-gather splice experts from
+    different ranks together.
+    """
+
+    class _ExpertModel(_UniformDtypeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.experts = nn.Parameter(torch.zeros(4, 2))
+            self.attn = nn.Parameter(torch.zeros(4, 2))
+
+    def test_matching_params_are_excluded(self):
+        model = self._ExpertModel()
+
+        ignored = fsdp_load._resolve_fsdp_ignored_params(
+            model, [lambda name, _param: name == "experts"]
+        )
+
+        self.assertEqual({id(p) for p in ignored}, {id(model.experts)})
+
+    def test_no_conditions_excludes_nothing(self):
+        self.assertEqual(
+            fsdp_load._resolve_fsdp_ignored_params(self._ExpertModel(), None), set()
+        )
+
+    def test_stale_predicate_matching_nothing_raises(self):
+        # Silently returning an empty set is indistinguishable from "no
+        # exclusions requested": FSDP would shard the experts and the
+        # post-shard assert would also find nothing to complain about.
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            fsdp_load._resolve_fsdp_ignored_params(
+                self._ExpertModel(), [lambda name, _param: name == "renamed_experts"]
+            )
+
+
 class TestOrdinaryWeightLoading(unittest.TestCase):
     def test_direct_device_loading_skips_rank_local_cpu_checkpoint(self):
         load_plan = WeightLoadPlan(

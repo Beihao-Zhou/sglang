@@ -1,0 +1,233 @@
+---
+title: "Expert Parallelism"
+metatags:
+    description: "Shard MoE-DiT experts across tensor parallel ranks in SGLang Diffusion: the ep_size contract, memory and latency gains, the bf16 numerics that make output sample-dependent, and the kernel pitfalls the implementation guards against."
+---
+
+Expert parallelism (EP) shards the experts of a MoE DiT across GPUs instead of
+replicating them on every rank. On a 128-expert model the expert weights are the
+overwhelming majority of the parameters, so replicating them is what forces a
+large MoE DiT into CPU offload — or out of memory entirely.
+
+EP is enabled with `--ep-size`, and currently applies to the LingBot-Video MoE
+DiT.
+
+```bash
+sglang generate --model-path <lingbot-video-moe> \
+  --num-gpus 2 --tp-size 2 --ep-size 2 \
+  --prompt "..." --save-output
+```
+
+## The `ep_size == tp_size` contract
+
+`--ep-size` must be either `1` (disabled) or exactly equal to `--tp-size`.
+
+The reason is what makes the current design cheap: **the EP group is the TP
+group**, which mirrors srt's own `_MOE_EP = _TP` shortcut. Each rank computes the
+partial output of only the experts it owns, and a single all-reduce over the TP
+group re-forms the dense result. That is only valid because every rank in a TP
+group holds the *same tokens* — attention's `RowParallelLinear` all-reduces its
+output, so the MoE block sees identical activations on every TP rank, and the
+router therefore makes identical decisions.
+
+This is also why EP cannot ride the sequence parallel group. Under SP each rank
+holds a *different slice* of the sequence, so a rank's tokens would need experts
+living on other ranks. Routing them there requires all-to-all token dispatch,
+which is not implemented yet.
+
+<Warning>
+The practical trap: `--num-gpus N` on its own resolves to `tp_size=1` with every
+remaining GPU assigned to `sp_degree`, so `--ep-size N` is rejected. **You must
+pass `--tp-size` explicitly** to use EP.
+</Warning>
+
+Because EP reuses the TP ranks it consumes no extra GPUs and does not enter the
+`num_gpus = cfg_parallel_degree × tp_size × sp_degree` product. The expert count
+must be divisible by `ep_size`.
+
+## What it buys
+
+Measured on 2×H100 80GB, LingBot-Video MoE 30B, 640×384, 17 frames, 12 steps,
+`--tp-size 2`, identical seed and prompt, with `ep_size` as the only variable:
+
+| | `--ep-size 1` | `--ep-size 2` | `--ep-size 2` + FSDP |
+| --- | --- | --- | --- |
+| VRAM per GPU (after load) | 74.4 GB | 31.5 GB | sharded |
+| VRAM per GPU (denoise peak) | 74.4 GB | 42.0 GB | — |
+| Denoise per step | 1.81 s / 1.64 s | 1.39 s / 1.13 s | — |
+| Total pixel-generation time | 63.7 s | 31.5 s | 8.5 s |
+
+Two runs of each configuration are shown for per-step time because wall-clock
+varies with filesystem cache warmth; the ordering is stable across pairings.
+
+The dense configuration only fits at all because the auto-tuner turns on DiT CPU
+offload. That is the real cost EP removes: halving the resident expert weights
+also halves the per-block host-to-device streaming traffic, so EP more than pays
+back the all-reduce it adds. With FSDP, EP removes the need for offload entirely.
+
+## Numerical behavior: EP selects a sample
+
+<Warning>
+Enabling EP changes the generated output. It does not degrade it, and the expert
+math is exact — but a fixed seed does **not** reproduce the non-EP result. Treat
+`ep_size` as part of the sampling configuration, exactly like
+`use_fsdp_inference`.
+</Warning>
+
+This surprises people, so the measurements are worth stating in full.
+
+**The expert computation is bitwise exact.** Comparing the unreduced per-expert
+outputs (`no_combine`) of an EP-sharded run against the dense run gives a
+*bitwise identical* result. The contiguous expert partition, the non-local-expert
+filtering, and the weight slicing contribute exactly zero error.
+
+**The difference is where the top-k sum gets rounded.** For a token routed to 8
+experts, the dense path accumulates all eight contributions in fp32 and rounds
+once:
+
+```text
+dense:  out = bf16(c1 + c2 + ... + c8)                      # 1 rounding
+EP-2:   pA  = bf16(c1 + c2 + c3 + c4)                       # rank A rounds
+        pB  = bf16(c5 + c6 + c7 + c8)                       # rank B rounds
+        out = bf16(pA + pB)                                 # all-reduce rounds
+```
+
+Dense performs one rounding; EP performs `ep_size + 1`. Measured per MoE block at
+the production shape (128 experts, top-k 8), the gap is cosine `0.9999933`, i.e.
+**0.94 bf16 ulp** — the floor for splitting a bf16 sum.
+
+Three independent checks confirm this is rounding and not a logic error:
+
+- The error scales with mantissa width. The identical test in fp16 gives a max
+  delta exactly 8× smaller than bf16; fp16 carries 3 more mantissa bits.
+- At `top_k = 2` EP is **bit-exact**, because srt combines two slots with a plain
+  `torch.add` of already-bf16 rows — a form EP reproduces exactly. The divergence
+  appears precisely when srt switches to the fp32-accumulating `moe_sum_reduce`
+  at `top_k > 2`.
+- At `ep_size = 1` the path is bit-identical to the pre-EP implementation.
+
+**Why one ulp becomes a visibly different video.** 0.94 ulp per block compounded
+over 48 blocks predicts a 2.5% perturbation after a single DiT forward. Measured
+at one denoise step: 2.17%, PSNR 31.0 dB. Over 12 steps a diffusion sampler
+amplifies that chaotically into a different — equally valid — draw: PSNR 13.8 dB,
+cosine 0.968, same scene and prompt adherence.
+
+For context, the same comparison across other configuration changes:
+
+| Change (12 steps) | Cosine vs dense non-FSDP baseline |
+| --- | --- |
+| Enable EP (`ep_size` 2) | 0.968 |
+| Enable EP under FSDP (`ep_size` 1 → 2) | 0.934 |
+| Enable FSDP, EP off | 0.808 |
+
+Turning on FSDP with EP disabled perturbs the sample *more* than turning on EP.
+Sample dependence on reduction order is a pre-existing property of this bf16
+pipeline, not something EP introduces.
+
+Reproducibility is preserved *within* a configuration: two runs at the same
+`ep_size` are bitwise identical, as are two runs of the dense baseline.
+
+**fp32 in the reduction does not fix this.** Three strategies were measured:
+
+| Reduction strategy | Cosine vs dense |
+| --- | --- |
+| bf16 partials + bf16 all-reduce (current) | 0.9999959 |
+| bf16 partials + fp32 all-reduce | 0.9999959 (no change) |
+| per-slot outputs, weights and sum in fp32 | 0.9999949 (slightly worse) |
+| dense re-summed from **its own** per-slot outputs | 0.9999949 |
+
+An fp32 all-reduce changes nothing because the partial was already rounded to
+bf16 *inside* `fused_experts`. And reconstructing dense from dense's own
+per-expert outputs misses by the same margin — the kernel computes
+`bf16(acc * w)` while any external reconstruction only has `bf16(acc) * w`.
+Closing the gap requires an fp32 partial-output mode inside srt's
+`fused_experts`, not fp32 in the diffusion-side reduction.
+
+## Implementation notes
+
+The pieces, all in `python/sglang/multimodal_gen/`:
+
+- **`runtime/layers/moe.py`** — `resolve_moe_expert_parallel()` derives the
+  contiguous shard (`num_local_experts`, `local_expert_start`) from the TP group.
+  `LingBotVideoGroupedExperts` then allocates only the local experts.
+- **Non-local expert filtering** — `to_local_expert_ids()` rebases global expert
+  ids into the rank's local range and maps everything else to `-1`. Setting
+  `num_local_experts != num_experts` in `MoeRunnerConfig` flips on srt's
+  `filter_expert`, and the Triton kernels write hard zeros for filtered blocks
+  *before* applying the routing weight, so a non-local expert contributes
+  exactly `0`.
+- **The all-reduce** — `LingBotVideoSparseMoeBlock.forward` all-reduces the expert
+  output over the TP group. This must happen **before** `shared_experts` is
+  added: the shared-expert output is replicated on every rank, so summing it too
+  would scale it by `ep_size`.
+- **Load-time sharding** — `pack_expert_weights()` packs `w1`+`w3` into
+  `w13_weight` and slices both it and `w2` on dim 0 to the rank's expert range.
+  The router stays whole and replicated, which is what keeps routing decisions
+  identical across ranks.
+- **FSDP exclusion** — expert weights are handed to FSDP2 as `ignored_params` via
+  the model's `_fsdp_ignored_param_conditions`. EP already owns them, and FSDP's
+  all-gather assumes every rank holds a shard of the *same* tensor.
+
+### The `-1` sentinel is mandatory
+
+Non-local experts must be marked with exactly `-1`. This is not a free choice:
+
+- `moe_align_block_size` shifts expert ids by `+1` into an `(E + 1)`-entry
+  histogram, so `-1` lands in a dedicated pad bucket and its blocks are labelled
+  `-1` for the GEMMs to skip.
+- An id equal to `num_local_experts` (a tempting "one past the end" sentinel)
+  writes past the shared-memory histogram and can later index `w1[E]` — an
+  out-of-bounds weight read, i.e. silent corruption.
+
+`-1` is also srt's own repo-wide sentinel, used by the standard token dispatcher
+and honored by the Triton and DeepGEMM runners.
+
+### Guarded kernel hazards
+
+Two srt Triton MoE paths mishandle the filtered-block zero-store, and both are
+reachable *only* when EP is on (`filter_expert = True`). Neither fires on the
+default configuration, so the MoE block fails loudly rather than silently
+corrupting if either is ever enabled:
+
+- `--enable-fused-moe-sum-all-reduce` with `top_k > 2` points the store at the
+  combined output while the zero-store still indexes rows by `token * topk`,
+  writing out of bounds.
+- A tuned `*_down.json` carrying `USE_TMA` makes the up-GEMM output
+  expert-sorted while the zero-store keeps unsorted row indices.
+
+### Double-sharding guard
+
+If expert weights were both EP-sharded and FSDP-sharded, FSDP's all-gather would
+splice experts from different ranks together — a silent wrong answer, not a
+crash. Two guards cover this: the loader raises if an
+`_fsdp_ignored_param_conditions` predicate matches *no* parameter (a stale name
+pattern would otherwise look identical to "no exclusions requested"), and it
+raises again if any matched parameter comes back as a `DTensor` after sharding.
+
+A healthy run logs the exclusion, e.g. for 48 blocks × 2 expert tensors:
+
+```text
+Excluding 96 parameters from FSDP sharding in LingBotVideoTransformer3DModel
+```
+
+## Verifying a change to EP
+
+Final-frame parity against the dense path is **not** a usable gate — as shown
+above, a correct EP implementation still produces a different sample after 12
+steps. Use instead:
+
+1. **Per-operator agreement.** Compare `fused_experts` run densely against the
+   summed per-rank partials at the production shape. Expect ~1 bf16 ulp
+   (cosine `> 0.99999`), and bit-exactness at `top_k = 2` and at `ep_size = 1`.
+   Covered by `test/unit/test_lingbot_video_moe.py`.
+2. **Single-step trajectory.** One denoise step leaves no room for chaotic
+   amplification; expect roughly a 2-3% perturbation, PSNR around 30 dB.
+3. **Determinism.** Two runs at the same `ep_size` must be bitwise identical.
+4. **Memory.** Per-rank expert VRAM should drop by about `1 / ep_size`.
+
+<Note>
+When writing precision assertions, do not generalize from a small `top_k = 2`
+fixture. That case is bit-exact for a structural reason that does not hold at the
+shipped `top_k = 8`, and an `rtol=0, atol=0` assertion there advertises a
+guarantee the real model does not have.
+</Note>

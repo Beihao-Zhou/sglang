@@ -25,6 +25,8 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoMLP,
     LingBotVideoSparseMoeBlock,
+    MoeExpertParallelInfo,
+    resolve_moe_expert_parallel,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -60,8 +62,56 @@ LINGBOT_VIDEO_FP32_MODULES = (
 )
 
 
+EXPERT_PARAM_SUFFIXES = (".ffn.experts.w13_weight", ".ffn.experts.w2")
+
+
 def is_lingbot_block(name: str, _module: object) -> bool:
     return "blocks" in name and name.split(".")[-1].isdigit()
+
+
+def is_expert_parallel_param(name: str, _param: object) -> bool:
+    """Expert weights owned by EP, which FSDP must therefore leave alone.
+
+    FSDP2 all-gathers shards across the mesh assuming every rank holds a piece
+    of the *same* tensor; under EP each rank holds different experts, so an
+    all-gather would splice experts from different ranks together.
+    """
+    return name.endswith(EXPERT_PARAM_SUFFIXES)
+
+
+def pack_expert_weights(
+    weight_iterator: Iterable[tuple[str, torch.Tensor]],
+    *,
+    ep_info: MoeExpertParallelInfo,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Pack experts.w1+w3 into experts.w13_weight, gate then up on dim 1.
+
+    experts.w2 passes through. Under expert parallelism both are sliced on dim 0
+    down to the experts this rank owns; the router stays full and replicated.
+    """
+
+    def shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if not ep_info.enabled or not is_expert_parallel_param(name, None):
+            return tensor
+        start = ep_info.local_expert_start
+        return tensor[start : start + ep_info.num_local_experts]
+
+    seen: dict[str, list[torch.Tensor | None]] = {}
+    for name, tensor in weight_iterator:
+        suffix = next(
+            (s for s in (".ffn.experts.w1", ".ffn.experts.w3") if name.endswith(s)),
+            None,
+        )
+        if suffix is None:
+            yield name, shard(name, tensor)
+            continue
+        prefix = name[: -len(suffix)]
+        pair = seen.setdefault(prefix, [None, None])
+        pair[0 if suffix.endswith(".w1") else 1] = tensor
+        if pair[0] is not None and pair[1] is not None:
+            packed_name = f"{prefix}.ffn.experts.w13_weight"
+            yield packed_name, shard(packed_name, torch.cat(pair, dim=1))
+            del seen[prefix]
 
 
 def should_keep_in_fp32(name: str) -> bool:
@@ -388,22 +438,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     def preprocess_loaded_state_dict(
         self, weight_iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        # Pack experts.w1+w3 into experts.w13_weight, gate then up on dim 1; w2 passes through.
-        seen: dict[str, list[torch.Tensor | None]] = {}
-        for name, tensor in weight_iterator:
-            suffix = next(
-                (s for s in (".ffn.experts.w1", ".ffn.experts.w3") if name.endswith(s)),
-                None,
-            )
-            if suffix is None:
-                yield name, tensor
-                continue
-            prefix = name[: -len(suffix)]
-            pair = seen.setdefault(prefix, [None, None])
-            pair[0 if suffix.endswith(".w1") else 1] = tensor
-            if pair[0] is not None and pair[1] is not None:
-                yield f"{prefix}.ffn.experts.w13_weight", torch.cat(pair, dim=1)
-                del seen[prefix]
+        return pack_expert_weights(weight_iterator, ep_info=self.ep_info)
 
     def __init__(
         self,
@@ -423,6 +458,10 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
+        self.ep_info = resolve_moe_expert_parallel(config.num_experts)
+        if self.ep_info.enabled:
+            # EP owns the expert weights, so FSDP must leave them alone.
+            self._fsdp_ignored_param_conditions = [is_expert_parallel_param]
         self.in_channels = config.in_channels
         self.out_channels = config.out_channels
         self.num_channels_latents = config.out_channels

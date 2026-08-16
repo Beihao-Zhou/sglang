@@ -26,6 +26,10 @@ class BaseDiT(nn.Module, ABC):
     # Concrete DiT implementations override them when their tensor layout or
     # execution semantics support only a subset of the available backends.
     _fsdp_shard_conditions: list = []
+    # Parameters FSDP must not shard because another axis already owns them
+    # (e.g. expert parallelism holds a different expert slice per rank, which
+    # FSDP's all-gather would splice together). Predicates take (name, param).
+    _fsdp_ignored_param_conditions: list = []
     _compile_conditions: list = []
     # Methods that drive a forward pass without going through __call__. FSDP2
     # only unshards around the wrapped module's own forward, so anything the

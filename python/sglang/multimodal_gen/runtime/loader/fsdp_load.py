@@ -177,6 +177,73 @@ def _resolve_fsdp_shard_conditions(
     return [_is_common_numbered_block], "common-numbered-block"
 
 
+def _matching_param_names(
+    model: torch.nn.Module,
+    conditions: list[Callable[[str, nn.Parameter], bool]],
+) -> list[str]:
+    return [
+        name
+        for name, param in model.named_parameters()
+        if any(condition(name, param) for condition in conditions)
+    ]
+
+
+def _resolve_fsdp_ignored_params(
+    model: torch.nn.Module,
+    fsdp_ignored_param_conditions: list[Callable[[str, nn.Parameter], bool]] | None,
+) -> set[nn.Parameter]:
+    """Parameters another parallelism axis owns, which FSDP must not shard."""
+    if not fsdp_ignored_param_conditions:
+        return set()
+    param_dict = dict(model.named_parameters())
+    names = _matching_param_names(model, fsdp_ignored_param_conditions)
+    if not names:
+        # A predicate that matches nothing is indistinguishable downstream from
+        # "no exclusions requested": ignored_params stays empty, FSDP shards the
+        # parameters anyway, and _assert_params_not_sharded also finds nothing to
+        # complain about. Fail here instead -- this is how a stale name pattern
+        # (e.g. EXPERT_PARAM_SUFFIXES drifting from the module layout) turns into
+        # silently double-sharded weights.
+        raise RuntimeError(
+            f"{type(model).__name__} declared _fsdp_ignored_param_conditions but "
+            "no parameter matched; the predicates are stale and FSDP would shard "
+            "parameters another parallelism axis already owns"
+        )
+    logger.info(
+        "Excluding %d parameters from FSDP sharding in %s (e.g. %s)",
+        len(names),
+        type(model).__name__,
+        names[0],
+    )
+    return {param_dict[name] for name in names}
+
+
+def _assert_params_not_sharded(
+    model: torch.nn.Module,
+    fsdp_ignored_param_conditions: list[Callable[[str, nn.Parameter], bool]] | None,
+) -> None:
+    """Fail loudly if FSDP sharded a parameter another axis already owns.
+
+    Double-sharding is silent corruption: FSDP's all-gather assumes every rank
+    holds a shard of the same tensor, which is exactly what expert parallelism
+    violates.
+    """
+    if not fsdp_ignored_param_conditions:
+        return
+    param_dict = dict(model.named_parameters())
+    sharded = [
+        name
+        for name in _matching_param_names(model, fsdp_ignored_param_conditions)
+        if isinstance(param_dict[name], dist_tensor.DTensor)
+    ]
+    if sharded:
+        raise RuntimeError(
+            f"FSDP sharded {len(sharded)} parameters that are owned by another "
+            f"parallelism axis (e.g. {sharded[0]}); ignored_params did not take "
+            "effect and the all-gather would corrupt them"
+        )
+
+
 def _maybe_dequantize_fp8(
     full_tensor: torch.Tensor,
     target_dtype: torch.dtype,
@@ -332,6 +399,9 @@ def maybe_load_fsdp_model(
             mp_policy=mp_policy,
             mesh=device_mesh,
             fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
+            fsdp_ignored_param_conditions=getattr(
+                model, "_fsdp_ignored_param_conditions", None
+            ),
             pin_cpu_memory=pin_cpu_memory,
         )
         register_fsdp_entrypoints(model)
@@ -458,6 +528,9 @@ def shard_model(
     mp_policy: MixedPrecisionPolicy | None = MixedPrecisionPolicy(),  # noqa
     mesh: DeviceMesh | None = None,
     fsdp_shard_conditions: list[Callable[[str, nn.Module], bool]] | None = None,
+    fsdp_ignored_param_conditions: (
+        list[Callable[[str, nn.Parameter], bool]] | None
+    ) = None,
     pin_cpu_memory: bool = True,
 ) -> None:
     """
@@ -477,6 +550,9 @@ def shard_model(
             Default to None.
         fsdp_shard_conditions (List[Callable[[str, nn.Module], bool]]): A list of functions to determine
             which modules to shard with FSDP.
+        fsdp_ignored_param_conditions (List[Callable[[str, nn.Parameter], bool]]): A list of functions
+            to determine which parameters FSDP must leave alone, e.g. because expert parallelism
+            already owns them. Passed to every fully_shard call as `ignored_params`.
         pin_cpu_memory (bool): If set to True, FSDP will pin the CPU memory of the offloaded parameters.
 
     """
@@ -498,6 +574,10 @@ def shard_model(
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=pin_cpu_memory)
 
+    ignored_params = _resolve_fsdp_ignored_params(model, fsdp_ignored_param_conditions)
+    if ignored_params:
+        fsdp_kwargs["ignored_params"] = ignored_params
+
     # iterating in reverse to start with
     # lowest-level modules first
     num_layers_sharded = 0
@@ -516,6 +596,7 @@ def shard_model(
 
     # Finally shard the entire model to account for any stragglers
     fully_shard(model, **fsdp_kwargs)
+    _assert_params_not_sharded(model, fsdp_ignored_param_conditions)
     logger.info(
         "Applied FSDP to %d submodules in %s using %s shard conditions",
         num_layers_sharded,

@@ -1595,6 +1595,7 @@
                   "docs/sglang-diffusion/attention_backends",
                   "docs/sglang-diffusion/parallelism",
                   "docs/sglang-diffusion/ring_sp_performance",
+                  "docs/sglang-diffusion/expert_parallelism",
                   "docs/sglang-diffusion/encoder_parallel",
                   "docs/sglang-diffusion/dynamic_batching",
                   {

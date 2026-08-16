@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     PROMPT_TEMPLATE,
     LingBotVideoTextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _LINGBOT_MODULE_SUBDIRS = (
     "scheduler",
@@ -347,6 +348,16 @@ def test_preprocess_packs_w1_w3_into_w13_weight():
 # ---------------------------------------------------------------------------
 
 
+# The unit suite also runs on the AMD/ROCm lane, where torch.cuda.is_available()
+# is True -- so availability alone would not skip there. These cases drive srt's
+# CUDA Triton MoE kernels and its NCCL symmetric-memory allocation, which is not
+# what that lane is meant to cover.
+requires_cuda_moe = pytest.mark.skipif(
+    not torch.cuda.is_available() or current_platform.is_hip(),
+    reason="srt's Triton MoE + symmetric-memory path is CUDA-only",
+)
+
+
 def _ep_info(ep_size: int, ep_rank: int, num_experts: int) -> MoeExpertParallelInfo:
     num_local = num_experts // ep_size
     return MoeExpertParallelInfo(
@@ -604,7 +615,7 @@ def _dense_vs_ep_partial_sums(*, num_tokens, E, I, H, top_k, ep_size, seed):
     return ep_total, dense
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused_experts needs CUDA")
+@requires_cuda_moe
 @pytest.mark.parametrize("ep_size", [4, 8])
 def test_expert_parallel_partial_sums_are_exact_at_top_k_2(
     srt_single_rank_process_group, ep_size
@@ -624,7 +635,7 @@ def test_expert_parallel_partial_sums_are_exact_at_top_k_2(
     torch.testing.assert_close(ep_total, dense, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused_experts needs CUDA")
+@requires_cuda_moe
 def test_expert_parallel_partial_sums_match_dense_at_production_top_k(
     srt_single_rank_process_group,
 ):
@@ -647,7 +658,7 @@ def test_expert_parallel_partial_sums_match_dense_at_production_top_k(
     assert cosine > 0.99999
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused_experts needs CUDA")
+@requires_cuda_moe
 def test_expert_parallel_disabled_is_bit_identical(srt_single_rank_process_group):
     """ep_size == 1 must leave the dense path untouched (no filtering at all)."""
     ep_total, dense = _dense_vs_ep_partial_sums(

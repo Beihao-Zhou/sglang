@@ -203,6 +203,7 @@ def outplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    partial_output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -237,6 +238,7 @@ def outplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        partial_output_dtype=partial_output_dtype,
     )
 
 
@@ -262,6 +264,7 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    partial_output_dtype: Optional[torch.dtype] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -336,6 +339,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            partial_output_dtype=partial_output_dtype,
         )
 
 
@@ -497,6 +501,7 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    partial_output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -548,6 +553,14 @@ def _fused_moe_kernel_sequence(
         )
     elif inplace:
         out_hidden_states = hidden_states
+    elif partial_output_dtype is not None:
+        # Expert-parallel fp32 partial-output mode: emit the per-rank partial in
+        # fp32 (no bf16 rounding of the top-k combine) so the downstream cross-rank
+        # sum can round once, matching a dense single-rounding. Bypasses the NCCL
+        # symmetric pool (that path targets the bf16 fused all-reduce).
+        out_hidden_states = torch.empty(
+            hidden_states.shape, device=hidden_states.device, dtype=partial_output_dtype
+        )
     else:
         # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
         # allocation is required, so the downstream all-reduce takes the low-latency
@@ -876,7 +889,12 @@ def _fused_moe_kernel_sequence(
             ).squeeze(dim=1)
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
-            if _use_moe_sum_reduce_torch_compile(num_tokens):
+            # The fp32 partial-output mode routes through the torch reduce, which
+            # accumulates bf16 slots in fp32 and writes the fp32 out without a final
+            # round (the sgl-kernel moe_sum_reduce targets a same-dtype output).
+            if partial_output_dtype is not None or _use_moe_sum_reduce_torch_compile(
+                num_tokens
+            ):
                 moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
@@ -969,6 +987,7 @@ def fused_experts_impl(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    partial_output_dtype: Optional[torch.dtype] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1049,6 +1068,7 @@ def fused_experts_impl(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        partial_output_dtype=partial_output_dtype,
     )
 
 

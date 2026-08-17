@@ -171,6 +171,8 @@ class RankGenerator(object):
         cfg: int,
         dp: int,
         order: str,
+        *,
+        ep: int = 1,
         rank_offset: int = 0,
     ) -> None:
         self.tp = tp
@@ -178,11 +180,13 @@ class RankGenerator(object):
         self.pp = pp
         self.cfg = cfg
         self.dp = dp
+        self.ep = ep
         self.rank_offset = rank_offset
-        self.world_size = tp * sp * pp * cfg * dp
+        self.world_size = tp * sp * pp * cfg * dp * ep
 
         self.name_to_size = {
             "tp": self.tp,
+            "ep": self.ep,
             "sp": self.sp,
             "pp": self.pp,
             "cfg": self.cfg,

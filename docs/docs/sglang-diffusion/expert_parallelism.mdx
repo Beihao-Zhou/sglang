@@ -1,7 +1,7 @@
 ---
 title: "Expert Parallelism"
 metatags:
-    description: "Shard MoE-DiT experts across tensor parallel ranks in SGLang Diffusion: the ep_size contract, memory and latency gains, the bf16 numerics that make output sample-dependent, and the kernel pitfalls the implementation guards against."
+    description: "Shard MoE-DiT experts across GPUs in SGLang Diffusion with an orthogonal expert-parallel axis: how ep_size composes with TP and SP, memory and latency gains, the bf16 numerics that make output sample-dependent, and the kernel pitfalls the implementation guards against."
 ---
 
 Expert parallelism (EP) shards the experts of a MoE DiT across GPUs instead of
@@ -13,42 +13,49 @@ EP is enabled with `--ep-size`, and currently applies to the LingBot-Video MoE
 DiT.
 
 ```bash
+# Experts sharded 4-way, sequence split 2-way (Ulysses), orthogonally.
 sglang generate --model-path <lingbot-video-moe> \
-  --num-gpus 2 --tp-size 2 --ep-size 2 \
+  --num-gpus 8 --ep-size 4 --ulysses-degree 2 \
   --prompt "..." --save-output
 ```
 
-## The `ep_size == tp_size` contract
+## EP is its own parallel axis
 
-`--ep-size` must be either `1` (disabled) or exactly equal to `--tp-size`.
+EP is a first-class, orthogonal parallel dimension:
 
-The reason is what makes the current design cheap: **the EP group is the TP
-group**, which mirrors srt's own `_MOE_EP = _TP` shortcut. Each rank computes the
-partial output of only the experts it owns, and a single all-reduce over the TP
-group re-forms the dense result. That is only valid because every rank in a TP
-group holds the *same tokens* — attention's `RowParallelLinear` all-reduces its
-output, so the MoE block sees identical activations on every TP rank, and the
-router therefore makes identical decisions.
+```
+num_gpus = dp_size × cfg_parallel_degree × tp_size × ep_size × sp_degree
+```
 
-This is also why EP cannot ride the sequence parallel group. Under SP each rank
-holds a *different slice* of the sequence, so a rank's tokens would need experts
-living on other ranks. Routing them there requires all-to-all token dispatch,
-which is not implemented yet.
+`ep_size` composes with tensor and sequence parallelism instead of borrowing
+their ranks. `--num-gpus 8 --tp-size 2 --ep-size 4` is a genuine 2×4 mesh
+(attention sharded 2-way by TP, experts sharded 4-way by EP), mirroring srt's
+`moe_tp × moe_ep` model. This is what lets the target video layout — **sequence
+parallelism for attention + expert parallelism for the FFN** — run at once,
+rather than spending the GPU budget on TP and losing SP.
 
-<Warning>
-The practical trap: `--num-gpus N` on its own resolves to `tp_size=1` with every
-remaining GPU assigned to `sp_degree`, so `--ep-size N` is rejected. **You must
-pass `--tp-size` explicitly** to use EP.
-</Warning>
+Each rank computes the partial output of only the experts it owns, and a single
+all-reduce over the EP group re-forms the dense result. That is valid because the
+ranks in an EP group hold the *same tokens*: EP is orthogonal to SP, so an EP
+group shares one sequence slice (and one CFG branch and one TP shard), and the
+router therefore makes identical decisions across it.
 
-Because EP reuses the TP ranks it consumes no extra GPUs and does not enter the
-`num_gpus = cfg_parallel_degree × tp_size × sp_degree` product. The expert count
-must be divisible by `ep_size`.
+<Note>
+This "replicated-token" design still streams every token through every rank in
+the EP group. Removing that — routing each token only to its expert's rank via
+all-to-all **dispatch** — is the next step, and is what will let experts shard
+across ranks that hold *different* tokens.
+</Note>
+
+Because EP is its own axis it consumes its own GPUs and enters the `num_gpus`
+product above. The expert count must be divisible by `ep_size`.
 
 ## What it buys
 
 Measured on 2×H100 80GB, LingBot-Video MoE 30B, 640×384, 17 frames, 12 steps,
-`--tp-size 2`, identical seed and prompt, with `ep_size` as the only variable:
+identical seed and prompt, with `ep_size` as the only variable (these numbers
+predate the orthogonal-axis change and were taken on the earlier TP-coupled EP
+arrangement; the memory trend — per-rank expert VRAM ÷ `ep_size` — is unchanged):
 
 | | `--ep-size 1` | `--ep-size 2` | `--ep-size 2` + FSDP |
 | --- | --- | --- | --- |

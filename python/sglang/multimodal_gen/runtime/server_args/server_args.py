@@ -243,8 +243,8 @@ class ServerArgs(DisaggServerArgsMixin):
     node_rank: int = 0
     dist_init_addr: str | None = None
     tp_size: Optional[int] = None
-    # expert parallelism for MoE models: shards experts over the TP ranks, so
-    # it consumes no extra GPUs and must be either 1 (off) or tp_size
+    # expert parallelism for MoE models: a first-class orthogonal axis that
+    # shards experts across its own ep_size GPUs (num_gpus = dp*cfg*tp*ep*sp)
     ep_size: int = 1
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -1130,6 +1130,11 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.tp_size is None:
             self.tp_size = 1
 
+        # ep is a factor of the per-group product below, so reject a non-positive
+        # value here before it reaches a division.
+        if self.ep_size < 1:
+            raise ValueError(f"ep_size ({self.ep_size}) must be >= 1")
+
         if current_platform.is_cpu() and self.tp_size > 1:
             # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
             self.num_gpus = self.tp_size
@@ -1190,9 +1195,10 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.cfg_parallel_degree is None:
             self.cfg_parallel_degree = 2 if self.enable_cfg_parallel else 1
 
-        # adjust sp_degree: allocate all remaining GPUs after TP and DP
+        # adjust sp_degree: allocate all remaining GPUs after TP, EP, DP (and CFG).
+        # EP is its own orthogonal axis, so it consumes GPUs from the same budget.
         if self.sp_degree is None:
-            num_gpus_per_group = self.dp_size * self.tp_size
+            num_gpus_per_group = self.dp_size * self.tp_size * self.ep_size
             if self.enable_cfg_parallel:
                 num_gpus_per_group *= self.cfg_parallel_degree
             if self.num_gpus % num_gpus_per_group == 0:
@@ -1705,11 +1711,11 @@ class ServerArgs(DisaggServerArgsMixin):
             "--ep-size",
             type=int,
             default=ServerArgs.ep_size,
-            help="The expert parallelism size for MoE models. Shards the experts "
-            "over the tensor parallel ranks, so it uses no extra GPUs and must be "
-            "either 1 (disabled) or equal to --tp-size. Requires an explicit "
-            "--tp-size: it cannot ride the sequence parallel group, whose ranks "
-            "each hold a different slice of tokens. Defaults to 1.",
+            help="The expert parallelism size for MoE models. EP is its own "
+            "orthogonal axis (num_gpus = dp * cfg * tp * ep * sp), so it consumes "
+            "its own GPUs and composes with tensor and sequence parallelism, e.g. "
+            "--num-gpus 8 --ep-size 4 --ulysses-degree 2. num_experts must be "
+            "divisible by ep_size. Defaults to 1 (disabled).",
         )
         parser.add_argument(
             "--sp-degree",
@@ -2937,32 +2943,21 @@ class ServerArgs(DisaggServerArgsMixin):
                 "disaggregated roles scale by adding role instances instead"
             )
 
-        num_gpus_per_group = self.dp_size * self.tp_size
+        # EP is a first-class orthogonal axis (num_gpus = dp * cfg * tp * ep * sp),
+        # so it enters the per-group product just like tp.
+        if self.ep_size < 1:
+            raise ValueError(f"ep_size ({self.ep_size}) must be >= 1")
+
+        num_gpus_per_group = self.dp_size * self.tp_size * self.ep_size
         if self.enable_cfg_parallel:
             num_gpus_per_group *= self.cfg_parallel_degree
 
         if self.num_gpus % num_gpus_per_group != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size"
+                f" * ep_size"
                 f"{f' * {self.cfg_parallel_degree}' if self.enable_cfg_parallel else ''}"
                 f") = {num_gpus_per_group}"
-            )
-
-        # EP reuses the TP ranks (the EP group *is* the TP group), so it does not
-        # enter the num_gpus product above.
-        if self.ep_size < 1:
-            raise ValueError(f"ep_size ({self.ep_size}) must be >= 1")
-        if self.ep_size != 1 and self.ep_size != self.tp_size:
-            raise ValueError(
-                f"ep_size ({self.ep_size}) must be either 1 (disabled) or equal to "
-                f"tp_size ({self.tp_size}). Expert parallelism recovers the dense "
-                "result by summing each rank's partial output, which is only valid "
-                "across ranks holding the same tokens -- that is the tensor "
-                "parallel group. Pass --tp-size explicitly: with --num-gpus alone "
-                "every GPU beyond dp/cfg goes to sp_degree and tp_size stays 1, and "
-                "sequence-parallel ranks each hold a different slice of tokens "
-                "(routing them to remote experts needs all-to-all dispatch, which "
-                "is not implemented yet)."
             )
 
         if self.sp_degree != self.ring_degree * self.ulysses_degree:

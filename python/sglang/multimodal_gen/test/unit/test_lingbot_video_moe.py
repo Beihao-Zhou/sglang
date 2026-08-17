@@ -469,7 +469,7 @@ def _make_moe_block(**overrides):
 
 def test_moe_block_without_expert_parallel_owns_every_expert():
     # Also the only coverage of resolve_moe_expert_parallel's disabled path,
-    # which must not touch the (uninitialized) TP group.
+    # which must not touch the (uninitialized) EP group.
     block = _make_moe_block()
     assert not block.ep_enabled
     assert block.ep_info.ep_size == 1
@@ -484,8 +484,8 @@ def test_moe_block_with_expert_parallel_owns_only_its_shard(monkeypatch, ep_rank
     monkeypatch.setattr(
         moe_module, "get_global_server_args", lambda: SimpleNamespace(ep_size=4)
     )
-    monkeypatch.setattr(moe_module, "get_tp_world_size", lambda: 4)
-    monkeypatch.setattr(moe_module, "get_tp_rank", lambda: ep_rank)
+    monkeypatch.setattr(moe_module, "get_ep_world_size", lambda: 4)
+    monkeypatch.setattr(moe_module, "get_ep_rank", lambda: ep_rank)
 
     block = _make_moe_block()
 
@@ -504,8 +504,8 @@ def test_expert_parallel_rejects_indivisible_expert_count(monkeypatch):
     monkeypatch.setattr(
         moe_module, "get_global_server_args", lambda: SimpleNamespace(ep_size=3)
     )
-    monkeypatch.setattr(moe_module, "get_tp_world_size", lambda: 3)
-    monkeypatch.setattr(moe_module, "get_tp_rank", lambda: 0)
+    monkeypatch.setattr(moe_module, "get_ep_world_size", lambda: 3)
+    monkeypatch.setattr(moe_module, "get_ep_rank", lambda: 0)
 
     with pytest.raises(ValueError, match="divisible"):
         _make_moe_block(num_experts=8)

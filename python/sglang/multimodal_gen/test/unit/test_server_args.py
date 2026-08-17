@@ -2514,6 +2514,45 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.decoder_sp, 8)
 
 
+class TestExpertParallelMesh(unittest.TestCase):
+    """EP is a first-class orthogonal axis: num_gpus = dp * cfg * tp * ep * sp."""
+
+    def _args(self, **kwargs):
+        return _from_dict_without_model_resolution(
+            {"model_path": "/fake", "performance_mode": "manual", **kwargs}
+        )
+
+    def test_ep_composes_with_sp(self):
+        # ep steals no GPUs from sp any more: 8 = ep(4) x sp(2), tp stays 1.
+        args = self._args(num_gpus=8, ep_size=4, ulysses_degree=2)
+        self.assertEqual(args.ep_size, 4)
+        self.assertEqual(args.tp_size, 1)
+        self.assertEqual(args.sp_degree, 2)
+
+    def test_ep_composes_with_tp(self):
+        # 8 = tp(2) x ep(4); sp folds to 1.
+        args = self._args(num_gpus=8, tp_size=2, ep_size=4)
+        self.assertEqual(args.ep_size, 4)
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.sp_degree, 1)
+
+    def test_ep_enters_num_gpus_product(self):
+        # 6 is not divisible by tp(1) * ep(4), so it must be rejected -- the old
+        # code let ep ride the tp ranks and would have silently accepted this.
+        with self.assertRaisesRegex(ValueError, "ep_size"):
+            self._args(num_gpus=6, ep_size=4)
+
+    def test_ep_size_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "ep_size"):
+            self._args(num_gpus=4, ep_size=0)
+
+    def test_ep_disabled_leaves_sp_budget_untouched(self):
+        # ep_size == 1 must not change the resolved mesh: 4 = tp(2) x sp(2).
+        args = self._args(num_gpus=4, tp_size=2)
+        self.assertEqual(args.ep_size, 1)
+        self.assertEqual(args.sp_degree, 2)
+
+
 class TestPipelineResolutionCliOverride(unittest.TestCase):
     def setUp(self):
         _get_config_info.cache_clear()

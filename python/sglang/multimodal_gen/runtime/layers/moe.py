@@ -13,9 +13,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import (
-    get_tp_group,
-    get_tp_rank,
-    get_tp_world_size,
+    get_ep_group,
+    get_ep_rank,
+    get_ep_world_size,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
@@ -44,22 +44,23 @@ class MoeExpertParallelInfo(msgspec.Struct, frozen=True):
 def resolve_moe_expert_parallel(num_experts: int) -> MoeExpertParallelInfo:
     """Resolve the expert shard owned by this rank.
 
-    The EP group *is* the TP group (mirrors srt's `_MOE_EP = _TP` shortcut):
-    tokens are TP-replicated when they reach the MoE block and the router is
-    bit-identical across TP ranks, so slicing experts and summing the partial
-    outputs over the TP group reproduces the dense result exactly.
+    EP is its own orthogonal parallel axis (`get_ep_group()`): experts are
+    sharded across it while attention/norms/router replicate. Tokens reach the
+    MoE block replicated across the EP group and the router is bit-identical
+    across those ranks, so slicing experts and summing the partial outputs with
+    an all-reduce over the EP group reproduces the dense result exactly.
     """
-    # The short-circuit is load-bearing: get_tp_world_size() *raises* when the
-    # TP group is not initialized -- it does not fall back to 1 -- so reading it
+    # The short-circuit is load-bearing: get_ep_world_size() *raises* when the
+    # EP group is not initialized -- it does not fall back to 1 -- so reading it
     # unconditionally would break every single-process unit test that builds a
     # MoE block. With EP off there is nothing to resolve anyway.
-    ep_size = get_tp_world_size() if get_global_server_args().ep_size > 1 else 1
+    ep_size = get_ep_world_size() if get_global_server_args().ep_size > 1 else 1
     if num_experts % ep_size != 0:
         raise ValueError(
             f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
         )
     num_local_experts = num_experts // ep_size
-    ep_rank = get_tp_rank() if ep_size > 1 else 0
+    ep_rank = get_ep_rank() if ep_size > 1 else 0
     return MoeExpertParallelInfo(
         ep_size=ep_size,
         ep_rank=ep_rank,
@@ -312,7 +313,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
                 self.router.e_score_correction_bias.double().sum(),
             ]
         )
-        gathered = get_tp_group().all_gather(checksum.reshape(1, -1), dim=0)
+        gathered = get_ep_group().all_gather(checksum.reshape(1, -1), dim=0)
         if not torch.equal(gathered, gathered[:1].expand_as(gathered)):
             raise RuntimeError(
                 "MoE router weights differ across the expert parallel group "
@@ -384,7 +385,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             # Each rank computed the partial sum over the experts it owns.
             # This must happen before shared_experts is added: that output is
             # replicated, so summing it too would scale it by ep_size.
-            out = get_tp_group().all_reduce(out)
+            out = get_ep_group().all_reduce(out)
         out = out.reshape(b, -1, self.hidden_size)
         if self.shared_experts is not None:
             out = out + self.shared_experts(hidden_states)

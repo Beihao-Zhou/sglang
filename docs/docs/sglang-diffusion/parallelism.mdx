@@ -9,12 +9,13 @@ different dimension of the DiT forward pass, which is exactly why they can be
 combined: the total GPU count is the product of the degrees,
 
 ```text
-num_gpus = cfg_parallel_degree × tp_size × sp_degree
+num_gpus = cfg_parallel_degree × tp_size × ep_size × sp_degree
 sp_degree = ulysses_degree × ring_degree
 ```
 
-Expert parallelism is the exception to that product: it shards MoE experts across
-the ranks a TP group already uses, so it consumes no extra GPUs.
+Expert parallelism is a first-class, orthogonal axis: it shards MoE experts
+across its own `ep_size` ranks and composes with tensor and sequence parallelism
+(for example `--ep-size 4 --ulysses-degree 2`).
 
 This page is the map — what each axis does, which combinations are legal, and
 how to pick one. Per-axis depth lives in
@@ -29,7 +30,7 @@ axis with their own knob), and the [CLI reference](./api/cli).
 | --- | --- | --- | --- |
 | CFG parallel | guidance branches | one combine per denoise step | `--cfg-parallel-size` |
 | Tensor parallel (TP) | weights and attention heads | all-reduce per transformer block | `--tp-size` |
-| Expert parallel (EP) | MoE experts, over the TP ranks | all-reduce per MoE block | `--ep-size` |
+| Expert parallel (EP) | MoE experts, on its own orthogonal axis | all-reduce per MoE block | `--ep-size` |
 | Ulysses SP | sequence outside attention ↔ heads inside it | two all-to-alls per attention | `--ulysses-degree` |
 | Ring SP | sequence rows inside attention | neighbor-only K/V rotation, overlapped with compute | `--ring-degree` |
 | K/V-gather CP | sequence rows inside attention | one K/V all-gather per attention | `--kv-gather-degree` |

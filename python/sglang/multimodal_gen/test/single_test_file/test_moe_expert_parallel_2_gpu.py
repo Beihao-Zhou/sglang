@@ -88,10 +88,16 @@ def _worker() -> int:
 
     # fused_experts reads srt's runtime context and TP group; the GPU worker
     # seeds the first and _sync_srt_tp_group() hands over the second.
+    #
+    # EP is its own orthogonal axis now, so shard the experts over the EP group
+    # (ep_size=world) with tp_size=1 -- the ranks still hold identical (replicated)
+    # tokens, and the MoE block all-reduces its partials over get_ep_group().
     if get_context()._server_args is None:
         get_context().set_server_args(SrtServerArgs(model_path="dummy"))
     set_global_server_args(SimpleNamespace(ep_size=world))
-    maybe_init_distributed_environment_and_model_parallel(tp_size=world, sp_size=1)
+    maybe_init_distributed_environment_and_model_parallel(
+        tp_size=1, sp_size=1, ep_size=world
+    )
     ps._sync_srt_tp_group()
 
     failures = []
@@ -152,7 +158,7 @@ def _worker() -> int:
     x = torch.randn(
         1, 128, _HIDDEN, device="cuda", dtype=torch.bfloat16, generator=None
     )
-    dist.broadcast(x, src=0)  # identical activations, as TP replication gives
+    dist.broadcast(x, src=0)  # identical activations, as EP replication gives
     with torch.no_grad():
         ep_out = block(x)
 

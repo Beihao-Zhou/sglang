@@ -66,6 +66,7 @@ _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+_EP: GroupCoordinator | None = None
 _VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
@@ -181,6 +182,7 @@ def init_parallel_group_coordinator(
         "pipeline",
         "tensor",
         "sequence",
+        "expert",
         "classifier_free_guidance",
         "vae_decode",
     ], f"parallel_mode {parallel_mode} is not supported"
@@ -200,19 +202,26 @@ def init_parallel_group_coordinator(
             **kwargs,
         )
     else:
+        # Plain coordinator for data / tensor / expert / cfg / vae_decode. Only the
+        # tensor group uses srt's custom all-reduce; the rest go through the device
+        # communicator (expert parallelism sums its per-rank partial MoE outputs with
+        # a plain all_reduce over this group). Names other than "expert" match the
+        # historical mapping exactly (data falls through to "cfg_group").
+        if parallel_mode == "tensor":
+            group_name = "tp_group"
+        elif parallel_mode == "expert":
+            group_name = "ep_group"
+        elif parallel_mode == "vae_decode":
+            group_name = "vae_decode_group"
+        else:
+            group_name = "cfg_group"
         return GroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
             use_device_communicator=parallel_mode != "tensor",
             use_srt_custom_allreduce=parallel_mode == "tensor",
-            group_name=(
-                "tp_group"
-                if parallel_mode == "tensor"
-                else (
-                    "vae_decode_group" if parallel_mode == "vae_decode" else "cfg_group"
-                )
-            ),
+            group_name=group_name,
         )
 
 
@@ -320,6 +329,21 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
+def get_ep_group() -> GroupCoordinator:
+    assert _EP is not None, "expert parallel group is not initialized"
+    return _EP
+
+
+def get_ep_world_size() -> int:
+    """Number of ranks the experts are sharded across."""
+    return get_ep_group().world_size
+
+
+def get_ep_rank() -> int:
+    """This rank's index within its expert parallel group."""
+    return get_ep_group().rank_in_group
+
+
 # xDiT
 def initialize_model_parallel(
     data_parallel_size: int = 1,
@@ -328,6 +352,7 @@ def initialize_model_parallel(
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     tensor_parallel_degree: int = 1,
+    expert_parallel_degree: int = 1,
     pipeline_parallel_degree: int = 1,
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
@@ -387,12 +412,14 @@ def initialize_model_parallel(
         * sequence_parallel_degree
         * pipeline_parallel_degree
         * tensor_parallel_degree
+        * expert_parallel_degree
     )
 
     if world_size < dit_parallel_size:
         raise RuntimeError(
             f"world_size ({world_size}) is less than "
             f"tensor_parallel_degree ({tensor_parallel_degree}) x "
+            f"expert_parallel_degree ({expert_parallel_degree}) x"
             f"pipeline_parallel_degree ({pipeline_parallel_degree}) x"
             f"sequence_parallel_degree ({sequence_parallel_degree}) x"
             f"classifier_free_guidance_degree "
@@ -400,13 +427,18 @@ def initialize_model_parallel(
             f"data_parallel_degree ({data_parallel_size})"
         )
 
+    # ep is its own orthogonal axis: experts shard across it while attention/norms/router
+    # replicate. It sits next to tp in the order (fastest-varying block) so an EP group is
+    # contiguous; on a single node every pair is NVLink, so the ordering is perf-neutral
+    # here and only matters cross-node (revisit with profiling then).
     rank_generator: RankGenerator = RankGenerator(
         tensor_parallel_degree,
         sequence_parallel_degree,
         pipeline_parallel_degree,
         classifier_free_guidance_degree,
         data_parallel_size,
-        "tp-sp-pp-cfg-dp",
+        "tp-ep-sp-pp-cfg-dp",
+        ep=expert_parallel_degree,
     )
     global _DP
     assert _DP is None, "data parallel group is already initialized"
@@ -482,6 +514,15 @@ def initialize_model_parallel(
     )
     _sync_srt_tp_group()
 
+    global _EP
+    assert _EP is None, "expert parallel group is already initialized"
+    _EP = init_parallel_group_coordinator(
+        group_ranks=rank_generator.get_ranks("ep"),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="expert",
+    )
+
     global _VAE_DECODE
     assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
     _VAE_DECODE = init_parallel_group_coordinator(
@@ -533,6 +574,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     dp_size: int = 1,
+    ep_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
 ):
@@ -546,6 +588,9 @@ def maybe_init_distributed_environment_and_model_parallel(
         assert (
             get_sp_world_size() == sp_size
         ), f"You are trying to initialize model parallel groups with size {sp_size}, but they are already initialized with size {get_sp_world_size()}"
+        assert (
+            get_ep_world_size() == ep_size
+        ), f"You are trying to initialize model parallel groups with ep size {ep_size}, but they are already initialized with size {get_ep_world_size()}"
         return
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -573,6 +618,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         data_parallel_size=dp_size,
         classifier_free_guidance_degree=cfg_degree,
         tensor_parallel_degree=tp_size,
+        expert_parallel_degree=ep_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
@@ -587,6 +633,7 @@ def model_parallel_is_initialized() -> bool:
         and _SP is not None
         and _PP is not None
         and _TP is not None
+        and _EP is not None
         and _VAE_DECODE is not None
     )
 
@@ -922,7 +969,7 @@ def init_vae_group(
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
-    global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE
+    global _TP, _SP, _DP, _CFG, _PP, _EP, _VAE_DECODE, _DIT, _VAE
 
     _clear_srt_tp_group()
     # The IPC transport keeps CUDA mappings associated with the current
@@ -932,7 +979,7 @@ def destroy_model_parallel() -> None:
 
     IPC_A2A.reset()
 
-    for group in (_TP, _SP, _DP, _CFG, _PP, _VAE_DECODE):
+    for group in (_TP, _SP, _DP, _CFG, _PP, _EP, _VAE_DECODE):
         if group is not None:
             group.destroy()
 
@@ -956,4 +1003,4 @@ def destroy_model_parallel() -> None:
         if group is not None:
             torch.distributed.destroy_process_group(group)
 
-    _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE = (None,) * 8
+    _TP, _SP, _DP, _CFG, _PP, _EP, _VAE_DECODE, _DIT, _VAE = (None,) * 9

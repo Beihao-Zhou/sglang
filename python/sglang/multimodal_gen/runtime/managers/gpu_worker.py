@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_ep_group,
     get_ring_parallel_rank,
     get_ring_parallel_world_size,
     get_tp_group,
@@ -160,6 +161,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+
+        # EP ranks differ from the driver only on the expert axis, so requests must
+        # also be broadcast over the EP group -- otherwise a rank whose only non-zero
+        # coordinate is ep_rank never receives the request and its first EP collective
+        # (the MoE all_reduce / router guard) sees a dead peer.
+        self.ep_group = get_ep_group()
+        self.ep_cpu_group = self.ep_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
         self.memory_occupation: MemoryOccupationController | None = None
 

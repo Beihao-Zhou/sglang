@@ -1167,6 +1167,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 src=self.worker.tp_group.ranks[0],
             )
 
+        # EP is an orthogonal axis: a rank whose only non-zero coordinate is ep_rank
+        # is not reached by the sp/cfg/tp broadcasts above, so fan the request out over
+        # the EP group too. Without this its scheduler never gets the request and its
+        # first per-block EP collective deadlocks / crashes the run.
+        if self.server_args.ep_size > 1:
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.worker.ep_group.rank,
+                self.worker.ep_cpu_group,
+                src=self.worker.ep_group.ranks[0],
+            )
+
         assert recv_reqs is not None
 
         return recv_reqs

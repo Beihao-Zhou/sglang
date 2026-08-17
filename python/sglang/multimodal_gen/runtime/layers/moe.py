@@ -327,6 +327,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         tokens: torch.Tensor,
         top_scores: torch.Tensor,
         top_indices: torch.Tensor,
+        partial_output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -364,13 +365,19 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             routed_scaling_factor=None,
             gate_up_interleaved=False,
         )
-        return fused_experts(
+        out = fused_experts(
             tokens.contiguous().bfloat16(),
             self.experts.w13_weight.bfloat16(),
             self.experts.w2.bfloat16(),
             topk_output,
             runner_config,
-        ).type_as(tokens)
+            partial_output_dtype=partial_output_dtype,
+        )
+        # In the EP fp32-partial path, keep the fp32 partial so the caller can sum
+        # across ranks and round exactly once (matching the dense single-rounding).
+        if partial_output_dtype is not None:
+            return out
+        return out.type_as(tokens)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         b = hidden_states.shape[0]
@@ -380,12 +387,22 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             # then, and every rank reaches this in the same order.
             self._check_router_is_replicated()
         top_indices, top_scores = self.router(tokens)
-        out = self._run_sglang_triton_experts(tokens, top_scores, top_indices)
         if self.ep_enabled:
-            # Each rank computed the partial sum over the experts it owns.
-            # This must happen before shared_experts is added: that output is
-            # replicated, so summing it too would scale it by ep_size.
+            # Each rank computes the partial sum over the experts it owns, then the
+            # partials are summed across the EP group. Emitting the partial in fp32
+            # and rounding once *after* the all-reduce reproduces the dense path's
+            # single rounding exactly (bit-exact, and independent of ep_size);
+            # rounding each rank's partial to bf16 first would double-round.
+            #
+            # The all-reduce must precede shared_experts: that output is replicated,
+            # so summing it too would scale it by ep_size.
+            out = self._run_sglang_triton_experts(
+                tokens, top_scores, top_indices, partial_output_dtype=torch.float32
+            )
             out = get_ep_group().all_reduce(out)
+            out = out.to(tokens.dtype)
+        else:
+            out = self._run_sglang_triton_experts(tokens, top_scores, top_indices)
         out = out.reshape(b, -1, self.hidden_size)
         if self.shared_experts is not None:
             out = out + self.shared_experts(hidden_states)

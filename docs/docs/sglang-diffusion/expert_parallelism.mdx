@@ -72,25 +72,25 @@ offload. That is the real cost EP removes: halving the resident expert weights
 also halves the per-block host-to-device streaming traffic, so EP more than pays
 back the all-reduce it adds. With FSDP, EP removes the need for offload entirely.
 
-## Numerical behavior: EP selects a sample
+## Numerical behavior: EP is bit-exact to dense
 
-<Warning>
-Enabling EP changes the generated output. It does not degrade it, and the expert
-math is exact — but a fixed seed does **not** reproduce the non-EP result. Treat
-`ep_size` as part of the sampling configuration, exactly like
-`use_fsdp_inference`.
-</Warning>
+<Note>
+EP reproduces the dense (non-EP) output **bit-for-bit**, at every `ep_size`. A
+fixed seed gives the same sample with or without EP; `ep_size` is not part of the
+sampling configuration.
+</Note>
 
-This surprises people, so the measurements are worth stating in full.
+This required care, because the naive split is *not* bit-exact — the story below
+records why, and how the fp32 partial-output mode closes it.
 
-**The expert computation is bitwise exact.** Comparing the unreduced per-expert
-outputs (`no_combine`) of an EP-sharded run against the dense run gives a
-*bitwise identical* result. The contiguous expert partition, the non-local-expert
-filtering, and the weight slicing contribute exactly zero error.
+**The expert computation was already bitwise exact.** Comparing the unreduced
+per-expert outputs (`no_combine`) of an EP-sharded run against the dense run gives
+a *bitwise identical* result. The contiguous expert partition, the non-local-expert
+filtering, and the weight slicing contribute exactly zero error. Only the combine's
+rounding was ever the issue.
 
-**The difference is where the top-k sum gets rounded.** For a token routed to 8
-experts, the dense path accumulates all eight contributions in fp32 and rounds
-once:
+**The naive bf16 split double-rounds.** For a token routed to 8 experts, the dense
+path accumulates all eight contributions in fp32 and rounds once:
 
 ```text
 dense:  out = bf16(c1 + c2 + ... + c8)                      # 1 rounding
@@ -99,11 +99,34 @@ EP-2:   pA  = bf16(c1 + c2 + c3 + c4)                       # rank A rounds
         out = bf16(pA + pB)                                 # all-reduce rounds
 ```
 
-Dense performs one rounding; EP performs `ep_size + 1`. Measured per MoE block at
-the production shape (128 experts, top-k 8), the gap is cosine `0.9999933`, i.e.
-**0.94 bf16 ulp** — the floor for splitting a bf16 sum.
+Dense rounds once; the bf16 split rounds `ep_size + 1` times. Measured per MoE
+block at the production shape (128 experts, top-k 8), the split lands at cosine
+`0.999996` and **degrades as you shard more** — `0.999993` at `ep_size 8`, and the
+`ep_size 2` vs `ep_size 8` outputs differ by ~4 units. An fp32 all-reduce does not
+help: the partial was already rounded to bf16 *inside* `fused_experts`.
 
-Three independent checks confirm this is rounding and not a logic error:
+**The fix: an fp32 partial-output mode in `fused_experts`.** Each rank emits its
+partial in fp32 (skipping the in-kernel bf16 round of the top-k combine), the
+partials are summed across the EP group in fp32, and the result is rounded **once**,
+exactly reproducing the dense single-rounding:
+
+```text
+EP (fp32):  pA = fp32(c1+c2+c3+c4); pB = fp32(c5+c6+c7+c8)  # no rounding
+            out = bf16(pA + pB)                             # 1 rounding, == dense
+```
+
+Measured at the same shape: **cosine `1.00000000`, max relative error `0`,
+bit-exact — and independent of `ep_size`** (the `ep_size 2` and `ep_size 8` outputs
+are bit-identical). The mode is opt-in and free for everyone else: `fused_experts`
+takes a `partial_output_dtype` that defaults to `None` (no behavior change for any
+existing caller); the diffusion EP path passes `torch.float32` and rounds once
+after the all-reduce (`LingBotVideoSparseMoeBlock.forward`). Two runs at the same
+`ep_size` are of course also bitwise identical.
+
+<details>
+<summary>Historical: the bf16 gap, before the fp32 fix</summary>
+
+Three independent checks confirmed the pre-fix gap was rounding, not a logic error:
 
 - The error scales with mantissa width. The identical test in fp16 gives a max
   delta exactly 8× smaller than bf16; fp16 carries 3 more mantissa bits.
@@ -147,8 +170,10 @@ An fp32 all-reduce changes nothing because the partial was already rounded to
 bf16 *inside* `fused_experts`. And reconstructing dense from dense's own
 per-expert outputs misses by the same margin — the kernel computes
 `bf16(acc * w)` while any external reconstruction only has `bf16(acc) * w`.
-Closing the gap requires an fp32 partial-output mode inside srt's
-`fused_experts`, not fp32 in the diffusion-side reduction.
+Closing the gap required an fp32 partial-output mode inside srt's
+`fused_experts` — which is exactly what the production path now uses (above).
+
+</details>
 
 ## Implementation notes
 
@@ -232,22 +257,25 @@ end-to-end output is bitwise unchanged with the guard in place.
 
 ## Verifying a change to EP
 
-Final-frame parity against the dense path is **not** a usable gate — as shown
-above, a correct EP implementation still produces a different sample after 12
-steps. Use instead:
+With the fp32 partial-output mode, EP is **bit-exact to dense**, so parity *is* a
+usable gate:
 
-1. **Per-operator agreement.** Compare `fused_experts` run densely against the
-   summed per-rank partials at the production shape. Expect ~1 bf16 ulp
-   (cosine `> 0.99999`), and bit-exactness at `top_k = 2` and at `ep_size = 1`.
-   Covered by `test/unit/test_lingbot_video_moe.py`.
-2. **Single-step trajectory.** One denoise step leaves no room for chaotic
-   amplification; expect roughly a 2-3% perturbation, PSNR around 30 dB.
-3. **Determinism.** Two runs at the same `ep_size` must be bitwise identical.
-4. **Memory.** Per-rank expert VRAM should drop by about `1 / ep_size`.
+1. **Per-operator bit-exactness.** Compare `fused_experts` run densely against the
+   fp32 partial-output summed per-rank partials at the production shape (128
+   experts, top-k 8). Expect `rtol=0, atol=0` at every `ep_size`. Covered by
+   `test_expert_parallel_fp32_partial_is_bit_exact_at_production_top_k` in
+   `test/unit/test_lingbot_video_moe.py`.
+2. **Determinism / ep-invariance.** Two runs at the same `ep_size`, and runs at
+   different `ep_size`, must be bitwise identical.
+3. **Memory.** Per-rank expert VRAM should drop by about `1 / ep_size` (measured
+   29 GB/rank at `ep_size 2` vs 56 GB dense on the 30B model).
+4. **End-to-end.** With the fp32 path the decoded frames match the dense baseline;
+   final-frame parity is now a valid check, not just a coherence sanity check.
 
 <Note>
-When writing precision assertions, do not generalize from a small `top_k = 2`
-fixture. That case is bit-exact for a structural reason that does not hold at the
-shipped `top_k = 8`, and an `rtol=0, atol=0` assertion there advertises a
-guarantee the real model does not have.
+The bf16 partial path (`partial_output_dtype=None`) is *not* bit-exact at
+`top_k = 8` — it is ~1 ulp off and drifts with `ep_size`. The tests keep a
+`top_k = 2` bit-exact case and a `top_k = 8` ~1-ulp case documenting that legacy
+behavior; do not generalize the `top_k = 2` `rtol=0, atol=0` assertion to the bf16
+`top_k = 8` path. The production path uses fp32 partials and is bit-exact.
 </Note>

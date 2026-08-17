@@ -29,6 +29,19 @@
 >    collective crashed with NCCL "remote process exited". **e2e EP was broken before this
 >    fix**; the block-level 2-GPU test missed it (it calls `block()` directly, bypassing the
 >    scheduler request path).
+>
+> **Parity ceiling SOLVED — EP is now bit-exact to dense.** `EP_PLAN`'s ~1 bf16-ulp gap
+> (each rank's partial rounded to bf16 before the all-reduce → double-rounding, growing
+> with `ep_size`) is closed by an **fp32 partial-output mode in srt's `fused_experts`**
+> (opt-in `partial_output_dtype`, default `None` = no behavior change for any existing
+> caller). The EP path now emits the partial in fp32, all-reduces in fp32, and rounds
+> once — reproducing the dense single-rounding. Measured (E=128, I=768, H=2048, top_k=8):
+> `cos 1.00000000, max_rel 0, bit-exact, ep_size-invariant` (vs bf16's cos 0.999996→0.999993
+> and Δ=4.0 between ep2/ep8). **The srt kernel change lives on its own branch
+> `beihao/moe-ep-fp32-partial` (commit `e5fc330b07`) for a standalone srt PR** and is
+> cherry-picked onto this branch (`72b01e843d`) so the diffusion EP path can use it; the
+> diffusion wiring is in `LingBotVideoSparseMoeBlock.forward`. When the srt PR merges,
+> rebase this branch to drop the cherry-pick.
 
 Working notes for `beihao/moe-dit-ep` (draft). Scope: Phase 1 of `EP_PLAN.md` —
 expert parallelism for the LingBot-Video MoE DiT, EP group == TP group, no token

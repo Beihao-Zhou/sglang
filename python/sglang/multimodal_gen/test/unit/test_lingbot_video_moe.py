@@ -556,11 +556,16 @@ def srt_single_rank_process_group():
         dist.destroy_process_group()
 
 
-def _dense_vs_ep_partial_sums(*, num_tokens, E, I, H, top_k, ep_size, seed):
+def _dense_vs_ep_partial_sums(
+    *, num_tokens, E, I, H, top_k, ep_size, seed, partial_output_dtype=None
+):
     """Run fused_experts dense, then once per EP rank, and sum the partials.
 
-    Returns (ep_total, dense). The summation is done in the activation dtype
-    because that is what `GroupCoordinator.all_reduce` does on the real path.
+    Returns (ep_total, dense). With ``partial_output_dtype=None`` the partials are
+    bf16 and summed in bf16 -- the Phase-1 path, accurate to ~1 bf16 ulp. With
+    ``partial_output_dtype=torch.float32`` each rank emits an fp32 partial, the
+    partials are summed in fp32 and rounded once -- the production EP path, which
+    is bit-exact to the dense baseline (see `LingBotVideoSparseMoeBlock.forward`).
     """
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
@@ -576,7 +581,7 @@ def _dense_vs_ep_partial_sums(*, num_tokens, E, I, H, top_k, ep_size, seed):
     ).to(torch.int32)
     top_scores = torch.rand(num_tokens, top_k, device=device)
 
-    def run(w13_local, w2_local, topk_ids, num_local_experts):
+    def run(w13_local, w2_local, topk_ids, num_local_experts, part_dtype=None):
         runner_config = MoeRunnerConfig(
             num_experts=E,
             num_local_experts=num_local_experts,
@@ -596,13 +601,19 @@ def _dense_vs_ep_partial_sums(*, num_tokens, E, I, H, top_k, ep_size, seed):
             router_logits=torch.empty(0, device=device),
         )
         return fused_experts(
-            tokens.contiguous(), w13_local, w2_local, topk_output, runner_config
+            tokens.contiguous(),
+            w13_local,
+            w2_local,
+            topk_output,
+            runner_config,
+            partial_output_dtype=part_dtype,
         )
 
-    dense = run(w13, w2, top_indices, E)
+    dense = run(w13, w2, top_indices, E)  # reference: default bf16 output
 
     num_local = E // ep_size
-    ep_total = torch.zeros_like(dense)
+    acc_dtype = partial_output_dtype or dense.dtype
+    ep_total = torch.zeros(dense.shape, dtype=acc_dtype, device=dense.device)
     for rank in range(ep_size):
         ep_info = _ep_info(ep_size, rank, E)
         start = ep_info.local_expert_start
@@ -611,7 +622,10 @@ def _dense_vs_ep_partial_sums(*, num_tokens, E, I, H, top_k, ep_size, seed):
             w2[start : start + num_local].contiguous(),
             to_local_expert_ids(top_indices, ep_info).to(torch.int32),
             num_local,
+            part_dtype=partial_output_dtype,
         )
+    if partial_output_dtype is not None:
+        ep_total = ep_total.to(dense.dtype)  # single round after the fp32 sum
     return ep_total, dense
 
 
@@ -656,6 +670,26 @@ def test_expert_parallel_partial_sums_match_dense_at_production_top_k(
         ep_total.float().flatten(), dense.float().flatten(), dim=0
     ).item()
     assert cosine > 0.99999
+
+
+@requires_cuda_moe
+@pytest.mark.parametrize("ep_size", [2, 4, 8])
+def test_expert_parallel_fp32_partial_is_bit_exact_at_production_top_k(
+    srt_single_rank_process_group, ep_size
+):
+    """The production EP path: fp32 partial output + fp32 cross-rank sum + a single
+    round is BIT-EXACT to the dense baseline, at top_k=8 and every ep_size.
+
+    This is the fix for the bf16 double-rounding measured in the test above: the
+    per-rank partial is no longer rounded to bf16 before the sum, so EP reproduces
+    the dense single-rounding exactly and the result is independent of ep_size.
+    Requires `fused_experts`' `partial_output_dtype` mode.
+    """
+    ep_total, dense = _dense_vs_ep_partial_sums(
+        num_tokens=1024, E=128, I=512, H=1024, top_k=8, ep_size=ep_size, seed=1,
+        partial_output_dtype=torch.float32,
+    )
+    torch.testing.assert_close(ep_total, dense, rtol=0, atol=0)
 
 
 @requires_cuda_moe

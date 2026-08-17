@@ -1,5 +1,35 @@
 # EP draft branch — status, bugs fixed, problems met, next steps
 
+> ## Update 2026-08-17 — EP is now an orthogonal mesh axis (supersedes "EP group == TP")
+>
+> EP was promoted from the Phase-1 fold onto the TP group (`ep_size == tp_size`) to a
+> **first-class orthogonal `RankGenerator` axis**: `num_gpus = dp·cfg·tp·ep·sp`, EP
+> composing with both TP and SP (commit `bdf9e876ea`). The MoE compute is unchanged —
+> Phase-1's slice→filter→all_reduce, just reparameterized over a new `get_ep_group()`.
+> Sections below that say "EP group == TP group" describe the superseded design.
+>
+> **Token dispatch was evaluated and NOT built:** in the orthogonal SP+EP layout tokens are
+> EP-replicated, and srt itself all_reduces (never dispatches) when tokens are replicated —
+> dispatch there is ~3× the MoE comm for top_k=8 and only shrinks transient buffers, not the
+> residual/attention floor (which must stay EP-replicated for Ulysses). So all_reduce is the
+> correct design.
+>
+> **Real-model e2e validation (2×H100, `robbyant/lingbot-video-moe-30b-a3b`), PASSING:**
+> `--num-gpus 2 --ep-size 2 --cfg-parallel-size 1` (tp=1,ep=2,sp=1,cfg=1) completes and
+> saves coherent video. **DiT VRAM 29 GB/rank vs 56 GB dense (~½). Latency 30.75 s vs
+> 61.38 s** for the default cfg=2 run (per-step 1.17 s vs 1.68 s; both `--dit-cpu-offload`,
+> so EP is faster because it streams half the weights per rank).
+>
+> **Two findings:**
+> 1. **CFG×EP GPU budget** — LingBot auto-enables cfg-parallel=2 on 2 GPUs, so `--ep-size 2`
+>    needs cfg(2)·ep(2)=4 GPUs and is rejected on a 2-GPU pod. Pass `--cfg-parallel-size 1`.
+> 2. **Bug found & fixed (`ca14dd5c51`)** — the scheduler's `recv_reqs` broadcast the request
+>    over sp/cfg/tp groups but **not** the ep group, so a rank whose only non-zero coordinate
+>    is `ep_rank` never received the request; its scheduler died and the driver's first EP
+>    collective crashed with NCCL "remote process exited". **e2e EP was broken before this
+>    fix**; the block-level 2-GPU test missed it (it calls `block()` directly, bypassing the
+>    scheduler request path).
+
 Working notes for `beihao/moe-dit-ep` (draft). Scope: Phase 1 of `EP_PLAN.md` —
 expert parallelism for the LingBot-Video MoE DiT, EP group == TP group, no token
 dispatch.

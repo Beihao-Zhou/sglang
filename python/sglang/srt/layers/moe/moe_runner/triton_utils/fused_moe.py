@@ -100,6 +100,48 @@ def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
+def _validate_partial_output_mode(
+    partial_output_dtype: Optional[torch.dtype],
+    *,
+    inplace: bool,
+    no_combine: bool,
+    routed_scaling_factor: Optional[float],
+) -> None:
+    if partial_output_dtype is None:
+        return
+    if partial_output_dtype is not torch.float32:
+        raise ValueError("partial_output_dtype currently only supports torch.float32")
+    if inplace:
+        raise ValueError("partial_output_dtype requires inplace=False")
+    if no_combine:
+        raise ValueError("partial_output_dtype requires no_combine=False")
+    if routed_scaling_factor not in (None, 1.0):
+        raise ValueError(
+            "partial_output_dtype requires routed_scaling_factor to be None or 1.0"
+        )
+
+
+def _should_use_fused_moe_sum_all_reduce(
+    *,
+    enabled: bool,
+    no_combine: bool,
+    partial_output_dtype: Optional[torch.dtype],
+    filter_expert: bool,
+    topk: int,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+) -> bool:
+    return (
+        enabled
+        and not no_combine
+        and partial_output_dtype is None
+        and not filter_expert
+        and topk > 2
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+    )
+
+
 @register_custom_op(mutates_args=["hidden_states"])
 def inplace_fused_experts(
     hidden_states: torch.Tensor,
@@ -169,7 +211,55 @@ def inplace_fused_experts(
     )
 
 
-@register_custom_op(out_shape="hidden_states")
+def _outplace_fused_experts_fake(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
+    activation: str = "silu",
+    is_gated: bool = True,
+    apply_router_weight_on_input: bool = False,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
+    fuse_swiglu_interleaved: bool = False,
+    *,
+    partial_output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    _validate_partial_output_mode(
+        partial_output_dtype,
+        inplace=False,
+        no_combine=no_combine,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    return torch.empty(
+        hidden_states.shape,
+        device=hidden_states.device,
+        dtype=partial_output_dtype or hidden_states.dtype,
+    )
+
+
+@register_custom_op(fake_impl=_outplace_fused_experts_fake)
 def outplace_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -202,6 +292,8 @@ def outplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    *,
+    partial_output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -236,6 +328,7 @@ def outplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        partial_output_dtype=partial_output_dtype,
     )
 
 
@@ -261,7 +354,15 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    *,
+    partial_output_dtype: Optional[torch.dtype] = None,
 ):
+    _validate_partial_output_mode(
+        partial_output_dtype,
+        inplace=moe_runner_config.inplace,
+        no_combine=moe_runner_config.no_combine,
+        routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+    )
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
         moe_runner_config.num_experts is None
@@ -335,6 +436,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            partial_output_dtype=partial_output_dtype,
         )
 
 
@@ -388,12 +490,9 @@ def _prepare_fused_moe_run(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
+    filter_expert: bool,
 ):
-    """Resolve config, down_config, TMA flag, and aligned expert routing ids.
-
-    Shared by ``fused_experts_impl`` and ``pre_permute_standard_to_triton`` so
-    both paths compute alignment from the same source.
-    """
+    """Resolve configs, safe TMA modes, and aligned expert routing ids."""
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
@@ -433,7 +532,12 @@ def _prepare_fused_moe_run(
             "This requires a config produced by the updated tuning script. "
         )
     down_tma_requested = down_config is not None and down_config.pop("USE_TMA", False)
-    down_moe_use_tma = _moe_support_tma() and down_tma_requested
+    down_moe_use_tma = _moe_support_tma() and down_tma_requested and not filter_expert
+    if down_tma_requested and filter_expert:
+        logger.warning_once(
+            "Down MoE TMA is disabled for filtered expert routing because its "
+            "expert-sorted output is incompatible with the filtered zero-store."
+        )
     if down_moe_use_tma:
         logger.warning_once(
             "Down MoE TMA is enabled (USE_TMA=true in the down-projection config)."
@@ -496,6 +600,7 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    partial_output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -547,8 +652,16 @@ def _fused_moe_kernel_sequence(
         )
     elif inplace:
         out_hidden_states = hidden_states
+    elif partial_output_dtype is not None:
+        # Expert-parallel fp32 partial-output mode: emit the per-rank partial in
+        # fp32 (no bf16 rounding of the top-k combine) so the downstream cross-rank
+        # sum can round once, matching a dense single-rounding. Bypasses the
+        # symmetric pool (that path targets the same-dtype fused all-reduce).
+        out_hidden_states = torch.empty(
+            hidden_states.shape, device=hidden_states.device, dtype=partial_output_dtype
+        )
     else:
-        # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
+        # Allocate the MoE output in the collective symmetric-memory pool when
         # allocation is required, so the downstream all-reduce takes the low-latency
         # symmetric path. Only this output enters the pool; the intermediate caches
         # below stay on the default allocator to bound pool occupancy.
@@ -557,13 +670,27 @@ def _fused_moe_kernel_sequence(
         ):
             out_hidden_states = torch.empty_like(hidden_states)
 
-    use_fused_moe_sum_all_reduce = (
-        get_exec().moe.enable_fused_moe_sum_all_reduce
-        and (not no_combine)
-        and (topk > 2)
-        and (not use_int8_w8a16)
-        and (not use_int4_w4a16)
+    fused_moe_sum_all_reduce_enabled = get_exec().moe.enable_fused_moe_sum_all_reduce
+    use_fused_moe_sum_all_reduce = _should_use_fused_moe_sum_all_reduce(
+        enabled=fused_moe_sum_all_reduce_enabled,
+        no_combine=no_combine,
+        partial_output_dtype=partial_output_dtype,
+        filter_expert=filter_expert,
+        topk=topk,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
     )
+    if (
+        fused_moe_sum_all_reduce_enabled
+        and filter_expert
+        and not no_combine
+        and topk > 2
+    ):
+        logger.warning_once(
+            "Fused MoE sum/all-reduce is disabled for filtered expert routing "
+            "because its combined output is incompatible with the filtered "
+            "zero-store."
+        )
 
     if fuse_swiglu_interleaved:
         # W13 rows are physically interleaved (permuted once at load), so the
@@ -853,6 +980,18 @@ def _fused_moe_kernel_sequence(
 
     if no_combine:
         pass
+    elif partial_output_dtype is not None:
+        # A different output dtype is a reduction contract, not a platform
+        # choice. Accumulate the route-major kernel output into that dtype before
+        # entering CUDA/HIP/XPU-specific fast paths, which may round to the input
+        # dtype before storing. For top-k 1 the kernel already wrote directly to
+        # out_hidden_states.
+        if not (topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate):
+            moe_sum_reduce_torch_compile(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states,
+                routed_scaling_factor,
+            )
     elif _is_cuda or _is_musa:
         if use_fused_moe_sum_all_reduce:
             if routed_scaling_factor != 1.0:
@@ -961,7 +1100,15 @@ def fused_experts_impl(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    *,
+    partial_output_dtype: Optional[torch.dtype] = None,
 ):
+    _validate_partial_output_mode(
+        partial_output_dtype,
+        inplace=inplace,
+        no_combine=no_combine,
+        routed_scaling_factor=routed_scaling_factor,
+    )
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
@@ -972,7 +1119,7 @@ def fused_experts_impl(
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch"
+        ), "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -998,6 +1145,7 @@ def fused_experts_impl(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
+        filter_expert=filter_expert,
     )
 
     return _fused_moe_kernel_sequence(
@@ -1041,6 +1189,7 @@ def fused_experts_impl(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        partial_output_dtype=partial_output_dtype,
     )
 
 

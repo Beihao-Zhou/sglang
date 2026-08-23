@@ -133,6 +133,40 @@ class TestFusedMoeExpertParallelContract(CustomTestCase):
         self.assertTrue(results[False][2])
         self.assertFalse(results[True][2])
 
+    def test_prepare_does_not_mutate_cached_down_config(self):
+        up_config = {"BLOCK_SIZE_M": 16}
+        down_config = {"BLOCK_SIZE_M": 16, "USE_TMA": True}
+        aligned = (
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int32),
+            torch.tensor(0, dtype=torch.int32),
+        )
+
+        with (
+            patch.object(
+                fused_moe,
+                "try_get_optimal_moe_config",
+                return_value=(up_config, (down_config, None)),
+            ),
+            patch.object(fused_moe, "_moe_support_tma", return_value=True),
+            patch.object(fused_moe, "moe_align_block_size", return_value=aligned),
+        ):
+            fused_moe._prepare_fused_moe_run(
+                torch.zeros((1, 4), dtype=torch.bfloat16),
+                torch.zeros((2, 8, 4), dtype=torch.bfloat16),
+                torch.zeros((2, 4, 4), dtype=torch.bfloat16),
+                torch.zeros((1, 1), dtype=torch.int32),
+                use_fp8_w8a8=False,
+                use_int8_w8a8=False,
+                use_int8_w8a16=False,
+                use_int4_w4a16=False,
+                per_channel_quant=False,
+                block_shape=None,
+                filter_expert=True,
+            )
+
+        self.assertTrue(down_config["USE_TMA"])
+
     def test_filtered_and_partial_paths_disable_fused_sum_all_reduce(self):
         common = dict(
             enabled=True,

@@ -517,9 +517,11 @@ def _prepare_fused_moe_run(
         per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
-    # Copy config to avoid mutating the lru_cached dict returned by
+    # Copy configs to avoid mutating the lru_cached dicts returned by
     # get_moe_configs; we pop USE_TMA below.
     config = dict(config)
+    if down_config is not None:
+        down_config = dict(down_config)
     # Up-projection TMA is opt-in: only enabled when the up config file
     # explicitly carries "USE_TMA": true (produced by tuning). By default the
     # existing up config files do not contain this key, so existing users are

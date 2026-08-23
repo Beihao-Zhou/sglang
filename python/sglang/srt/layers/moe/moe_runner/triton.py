@@ -87,9 +87,7 @@ class TritonRunnerCore(MoeRunnerCore):
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
         if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
-            from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
-                fused_experts_mxfp8,
-            )
+            from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import fused_experts_mxfp8
 
             out = fused_experts_mxfp8(
                 runner_input.hidden_states,
@@ -186,9 +184,7 @@ def fused_experts_none_to_triton(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
-        from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
-            fused_experts_mxfp8,
-        )
+        from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import fused_experts_mxfp8
 
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         output = fused_experts_mxfp8(
@@ -282,6 +278,11 @@ def pre_permute_standard_to_triton(
 
     assert TopKOutputChecker.format_is_standard(topk_output)
 
+    filter_expert = (
+        runner_config.num_experts is None
+        or runner_config.num_experts != runner_config.num_local_experts
+    )
+
     (
         config,
         down_config,
@@ -301,6 +302,7 @@ def pre_permute_standard_to_triton(
         use_int4_w4a16=quant_info.use_int4_w4a16,
         per_channel_quant=quant_info.per_channel_quant,
         block_shape=quant_info.block_shape,
+        filter_expert=filter_expert,
     )
 
     running_state["config"] = config
